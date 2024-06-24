@@ -1,0 +1,214 @@
+#!/usr/bin/env ruby
+class Symbol; def ~@; _b = binding; Proc.new { |*a, &b| _b.send(self, *a, &b) }; end; end
+%w{ rubygems bundler cgi net/http uri }.map(&~:require)
+Bundler.require(:default)
+class Dex < Hashie::Mash; include Hashie::Extensions::MethodAccess; disable_warnings; end
+
+
+class ReTranslate
+  LineRegex = /^(?<indent>\s*)(?<key>\w+\:)?(?<content>(\S+\s{0,2})*)$/
+  def initialize(locale, filepath)
+    @locale = locale
+    @filepath = filepath
+  end
+
+  attr_reader :locale, :filepath, :result
+
+  def inspect
+    "<ReTranslate: #{@locale} from #{@filepath}>"
+  end
+
+  def execute!
+    perform_validations
+    @chunks = chunked_data @filepath
+    @result = @chunks.map {|_| block_translate _ }.join($/)
+  end
+
+  def perform_validations
+    validations = validate_language_or_locale
+    unless validations.include?(:language) || validations.include?(:locale)
+      puts "Unsupported language code: #{@locale}"
+      puts "Supported languages are: #{valid_languages.join(', ')}"
+      exit 1
+    end
+    if validations.include?(:locale) && !valid_locales.include?(@locale)
+      puts "Nonstandard locale support. #{@locale}"
+      puts "Will treat this as a language code, but write the file as listed."
+    end
+    if validations.include?(:country)
+      puts "The country code appears valid. We will look for items with this country code, or default to the US when key matching."
+    end
+  end
+
+  def normalize_locale
+    @locale = @locale.split(/[-_]/)
+    @language = @locale[0].downcase
+    @country = @locale[1] ? @locale[1].upcase : nil
+    @default_country = @country || 'US'
+    @locale = [@language, @country].compact.join(?-)
+  end
+
+  def validate_language_or_locale
+    normalize_locale
+    matches = []
+    if @country
+      matches << :locale if valid_locales.include?(@locale.downcase)
+      matches << :country if valid_countries.include?(@country)
+    end
+    matches << :language if valid_languages.include?(@language)
+    return matches
+  end
+
+  def valid_languages
+    ['af', 'sq', 'am', 'ar', 'hy', 'az', 'eu', 'be', 'bn', 'bs', 'bg', 'ca', 'ceb', 'ny', 'zh-CN', 'zh-TW', 'co', 'hr', 'cs', 'da', 'nl', 'en', 'eo', 'et', 'tl', 'fi', 'fr', 'fy', 'gl', 'ka', 'de', 'el', 'gu', 'ht', 'ha', 'haw', 'iw', 'hi', 'hmn', 'hu', 'is', 'ig', 'id', 'ga', 'it', 'ja', 'jw', 'kn', 'kk', 'km', 'ko', 'ku', 'ky', 'lo', 'la', 'lv', 'lt', 'lb', 'mk', 'mg', 'ms', 'ml', 'mt', 'mi', 'mr', 'mn', 'my', 'ne', 'no', 'or', 'ps', 'fa', 'pl', 'pt', 'pa', 'ro', 'ru', 'sm', 'gd', 'sr', 'st', 'sn', 'sd', 'si', 'sk', 'sl', 'so', 'es', 'su', 'sw', 'sv', 'tg', 'ta', 'te', 'th', 'tr', 'uk', 'ur', 'uz', 'vi', 'cy', 'xh', 'yi', 'yo', 'zu']
+  end
+
+  def valid_countries
+    %W[AF AL DZ AS AD AO AI AQ AG AR AM AW AU AT AZ BS BH BD BB BY BE BZ BJ BM BT BO BQ BA BW BV BR IO BN BG BF BI CV KH CM CA KY CF TD CL CN CX CC CO KM CD CG CK CR HR CU CW CY CZ CI DK DJ DM DO EC EG SV GQ ER EE SZ ET FK FO FJ FI FR GF PF TF GA GM GE DE GH GI GR GL GD GP GU GT GG GN GW GY HT HM VA HN HK HU IS IN ID IR IQ IE IM IL IT JM JP JE JO KZ KE KI KP KR KW KG LA LV LB LS LR LY LI LT LU MO MG MW MY MV ML MT MH MQ MR MU YT MX FM MD MC MN ME MS MA MZ MM NA NR NP NL NC NZ NI NE NG NU NF MP NO OM PK PW PS PA PG PY PE PH PN PL PT PR QA MK RO RU RW RE BL SH KN LC MF PM VC WS SM ST SA SN RS SC SL SG SX SK SI SB SO ZA GS SS ES LK SD SR SJ SE CH SY TW TJ TZ TH TL TG TK TO TT TN TR TM TC TV UG UA AE GB UM US UY UZ VU VE VN VG VI WF EH YE ZM ZW AX]
+  end
+
+  def valid_locales
+    #subset. doesn't even have portugal lol
+    ['en-au', 'en-gb', 'en-in', 'en-us', 'zh-hk', 'zh-tw', 'da-dk', 'nl-nl', 'fr-fr', 'fr-ca', 'hi-in', 'id-id', 'it-it', 'ja-jp', 'ko-kr', 'no-no', 'pl-pl', 'pt-br', 'ru-ru', 'es-es', 'es-419', 'sv-se', 'th-th', 'tr-tr']
+  end
+
+  def chunked_data(file)
+    lines = IO.readlines(file)
+    chunk_complete_min = 25
+    results = [] # an array of translated results
+    chunks = [] # each separate chunk to translate
+    while lines.length > 0
+      satisfied_chunk = false
+      until satisfied_chunk
+        line = lines.shift
+        chunk = []
+        matchvals = Dex.new line_matches(@lines[ptr])
+        if matchvals[:special] == :starter_line
+          @results.push('---') # we're not translating the starter line lol
+          next
+        end
+
+        min_indent ||= matchvals[:indent].length
+        # special case scenarios
+        indented_key = wrap_token [matchvals[:indent], matchvals[:key]].join
+        wrapped_line = wrap_token line.sub(/\s+$/, '')
+        if matchvals[:key]
+          if test_country = matchvals[:key] =~ /(US|UK|GB):/
+          # SPECIAL CASE: COUNTRY FILES
+            next unless [@country, @default_country].include?(test_country) # skip if it's not the country we're translating
+            chunks << [indented_key, wrap_sus_values(matchvals[:content])].join(' ')
+          elsif matchvals[:content][/\w+/]
+            # the case we hope for - standard key with content
+            chunks << [indented_key, wrap_sus_values(matchvals[:content])].join(' ')
+          else
+              # key without significant content - just pass the whole line
+            chunk << wrap_token(wrapped_line)
+          end
+        else # no key
+        # check for nested without content
+          if matchvals[:indent] > min_indent && matchvals[:content][/\w+/].nil?
+            chunks << wrapped_line
+            next
+          elsif matchvals[:content][/\S{2,}/]
+            # kinda content somehow
+            chunk.push wrap_sus_values(line.sub(/\s+$/, ''))
+          elsif matchvals[:content][/^\s+$/]
+            #no key, no content
+            chunk.push('')
+          end
+        end # keymatching
+        if chunk.length >= chunk_complete_min && @line[ptr + 1].match(LineRegex)[:indent].length <= min_indent
+          satisfied_chunk = true
+          @chunks.push(chunk.compact.join($/))
+        end
+      end # awaiting chunk
+    end # awaiting ptr catchup
+    @chunks
+  end
+
+  def clean_data(data)
+    data.gsub(/<span translation=no>(.*?)<\/span>/, '\1')
+  end
+
+  def line_matches(line)
+    return {key: nil, indent: 0, content: '---', special: :starter_line} if line =~ /^---/
+    m = line.match LineRegex
+    Dex.new({
+      key: (m[:key] || nil rescue nil),
+      indent: m[:indent] ? m[:indent].length : 0,
+      content: m[:content] ? m[:content].strip : ''
+    })
+  end
+
+  def wrap_token(tk)
+    "<span translation=no>#{tk}</span>"
+  end
+  alias_method :wrapped_token, :wrap_token
+
+  def wrap_sus_values(val)
+    #find and wrap html tags, interpolations like !{...}, %{...}, {%...%}, {{...}}, ${...}, and html/url encoded values
+    regexes = {
+      htmltag: /<[^>]+>/,
+      interpolation: /(?:\!|\%|\\{2})\{[^\}]+\}/,
+      erb: /\{\%[^\%]+\%\}/,
+      erb2: /\{\{[^\}]+\}\}/,
+      js: /\$\{[^\}]+\}/,
+      htmlenc: /&[a-z]+;/,
+      htmlunicode: /&#\d+;/
+    }
+    regexes.each_pair do |k, v|
+      val.gsub!(v) { |m| "<span translation=no>#{m}</span>" }
+    end
+  end
+
+  def block_translate(blockoflines)
+    # this was doing some compliated stuff before but now i'm just dumping stuff into google translate and wrapping the keys
+    clean_data google_translate(blockoflines.join($/))
+  end
+
+  def write_file
+    new_target = @filepath.sub(/\/en/, "/#{@locale.tr(?-, ?_)}")
+    IO.write(new_target, self.result)
+  end
+
+  def google_translate_key
+    ENV['GOOGLE_TRANSLATE_KEY'] || IO.read(File.expand_path('~/.google_api_key')).strip
+  end
+
+  def google_translate(value)
+    text = CGI.escape(value.gsub(/^\s*(\w{2})?\s+|\s+$/, ''))
+    response = JSON.parse(
+        URI.open("https://www.googleapis.com/language/translate/v2?q=#{text}&target=#{@lang}&key=#{google_translate_key}")
+    )
+      puts "Stopping - error in translate."
+      pp response.error
+      exit
+    end
+    response['data']['translations'][0]['translatedText'].to_s rescue "---block-translate-failed----"
+  end
+end
+
+if __FILE__ == $0
+  locale = ARGV.shift
+  filepath = ARGV.shift
+  dry_run = ARGV.shift == 'nofile'
+  en_sources = Dir.glob("#{filepath}/**/en*.y*ml")
+  unless locale =~ /^[a-z\-A-Z]{2,5}$/ && en_sources && en_sources.length > 0 && File.directory?(filepath)
+    puts "Incorrect usage."
+    puts "update-translations [lang/locale] [path_with_sources] [nofile (optional to not print to the standard output path)]"
+    exit
+  end
+  if en_sources.nil? || en_sources.length == 0
+    puts "No english translations found in #{filepath}"
+    exit
+  end
+  en_sources.each do |engfile|
+    t = ReTranslate.new(locale, engfile)
+    t.execute!
+    if dry_run
+      puts t.result
+    else
+      t.write_file
+    end
+  end
+end
